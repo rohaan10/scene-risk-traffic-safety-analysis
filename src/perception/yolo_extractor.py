@@ -98,12 +98,12 @@ class PerceptionResult:
 
 class YOLOPerceptionExtractor:
     """
-    Wraps YOLOv8 to detect road users and produce structured metadata.
+    Wraps YOLO26 to detect road users and produce structured metadata.
 
     Parameters
     ----------
     model_name : str
-        Ultralytics model identifier (e.g. ``"yolov8n.pt"``).
+        Ultralytics model identifier (e.g. ``"yolo26n.pt"``).
     confidence_threshold : float
         Minimum detection confidence to keep.
     device : str | None
@@ -112,7 +112,7 @@ class YOLOPerceptionExtractor:
 
     def __init__(
         self,
-        model_name: str = "yolov8n.pt",
+        model_name: str = "yolo26n.pt",
         confidence_threshold: float = 0.35,
         device: Optional[str] = None,
     ) -> None:

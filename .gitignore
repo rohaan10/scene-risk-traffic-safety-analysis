@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── Project-specific ──────────────────────────────────────────────────
+# YOLO model weights (auto-downloaded at runtime)
+*.pt
+
+# Data folder (raw images & ground truth are user-specific)
+data/
+
+# Generated output (annotated images & experiment results)
+output/

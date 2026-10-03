@@ -1,0 +1,28 @@
+[project]
+name = "traffic-risk-agent"
+version = "0.1.0"
+description = "Traffic scene risk-scoring agent: comparative VLM experiment with YOLO perception"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # ── Perception ──
+    "ultralytics>=8.3.0",       # YOLO26 support
+    "opencv-python>=4.8.0",
+
+    # ── Data & Numerics ──
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+
+    # ── Statistical evaluation ──
+    "scipy>=1.11.0",
+    "scikit-learn>=1.3.0",
+
+    # ── VLM API clients ──
+    "requests>=2.31.0",
+    "openai>=1.0.0",
+    "google-genai>=1.0.0",
+
+    # ── Utilities ──
+    "python-dotenv>=1.0.0",
+    "Pillow>=10.0.0",
+]

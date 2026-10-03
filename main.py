@@ -55,8 +55,8 @@ def parse_args() -> argparse.Namespace:
         help="VLM model name override (e.g. 'gpt-4o', 'gemini-2.0-flash').",
     )
     p.add_argument(
-        "--yolo-model", default="yolov8n.pt",
-        help="YOLO model weights file (default: yolov8n.pt).",
+        "--yolo-model", default="yolo26n.pt",
+        help="YOLO model weights file (default: yolo26n.pt).",
     )
     p.add_argument(
         "--yolo-conf", type=float, default=0.35,
