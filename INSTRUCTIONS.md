@@ -61,6 +61,8 @@ GEMINI_API_KEY=AIzaSy...your-key-here
 
 > **Important:** A web subscription (Gemini Advanced, ChatGPT Plus) does **not** provide API access. You need an API key from Google AI Studio (free) or OpenAI Platform (paid).
 
+> **Troubleshooting — "model not found" errors:** Google periodically retires older Gemini models. If you see a `404 NOT_FOUND` error mentioning the model is no longer available, update the default model in `src/reasoning/vlm_client.py` (look for `_DEFAULTS`) to the model name suggested in the error message. You can also override the model at runtime without editing code: `uv run python main.py --model gemini-3.8-flash`.
+
 ### 5. (Optional) Add ground truth scores
 
 If you have human-annotated risk scores, create `data/ground_truth.csv`:

@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--model", default=None,
-        help="VLM model name override (e.g. 'gpt-4o', 'gemini-2.0-flash').",
+        help="VLM model name override (e.g. 'gpt-4o', 'gemini-3.8-flash').",
     )
     p.add_argument(
         "--yolo-model", default="yolo26n.pt",

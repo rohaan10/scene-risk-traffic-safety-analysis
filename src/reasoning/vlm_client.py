@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -86,7 +87,7 @@ class VLMClient:
     provider : str
         ``"gemini"`` or ``"openai"``.
     model : str | None
-        Model identifier (e.g. ``"gemini-2.0-flash"`` or ``"gpt-4o"``).
+        Model identifier (e.g. ``"gemini-3.8-flash"`` or ``"gpt-4o"``).
         Defaults are chosen per provider if omitted.
     api_key : str | None
         Explicit API key.  Falls back to the ``GEMINI_API_KEY`` or
@@ -94,7 +95,7 @@ class VLMClient:
     """
 
     _DEFAULTS = {
-        "gemini": "gemini-2.0-flash",
+        "gemini": "gemini-3.8-flash",
         "openai": "gpt-4o",
     }
 
@@ -105,7 +106,7 @@ class VLMClient:
         api_key: Optional[str] = None,
     ) -> None:
         self.provider = provider.lower()
-        self.model = model or self._DEFAULTS.get(self.provider, "gemini-2.0-flash")
+        self.model = model or self._DEFAULTS.get(self.provider, "gemini-3.8-flash")
         self.api_key = api_key
 
         if self.provider == "gemini":
@@ -143,10 +144,15 @@ class VLMClient:
         self,
         image_path: str | Path,
         yolo_summary: Optional[str] = None,
+        max_retries: int = 3,
+        initial_backoff: float = 30.0,
     ) -> VLMResponse:
         """
         Send *image_path* (and optional *yolo_summary* for Condition B)
         to the VLM and return a parsed ``VLMResponse``.
+
+        Automatically retries on rate-limit (429) and transient (503)
+        errors with exponential backoff.
 
         Parameters
         ----------
@@ -154,6 +160,10 @@ class VLMClient:
             Path to the traffic scene image.
         yolo_summary : str | None
             If provided, Condition B prompt is used; otherwise Condition A.
+        max_retries : int
+            Maximum number of retry attempts on rate-limit / transient errors.
+        initial_backoff : float
+            Initial wait time in seconds before first retry (doubles each attempt).
         """
         image_path = str(image_path)
 
@@ -162,12 +172,29 @@ class VLMClient:
         else:
             user_prompt = build_condition_a_prompt()
 
-        if self.provider == "gemini":
-            raw = self._call_gemini(image_path, user_prompt)
-        else:
-            raw = self._call_openai(image_path, user_prompt)
+        last_error: Exception | None = None
+        for attempt in range(1 + max_retries):
+            try:
+                if self.provider == "gemini":
+                    raw = self._call_gemini(image_path, user_prompt)
+                else:
+                    raw = self._call_openai(image_path, user_prompt)
+                return parse_vlm_response(raw)
+            except Exception as e:
+                error_str = str(e)
+                is_retryable = ("429" in error_str or "503" in error_str
+                                or "RESOURCE_EXHAUSTED" in error_str
+                                or "UNAVAILABLE" in error_str)
+                if not is_retryable or attempt >= max_retries:
+                    raise
 
-        return parse_vlm_response(raw)
+                wait = initial_backoff * (2 ** attempt)
+                print(f"    ⏳ Rate limited, retrying in {wait:.0f}s "
+                      f"(attempt {attempt + 1}/{max_retries}) …")
+                time.sleep(wait)
+                last_error = e
+
+        raise last_error  # unreachable, but keeps type-checkers happy
 
     # ── Gemini back-end ──────────────────────────────────────────────
 
