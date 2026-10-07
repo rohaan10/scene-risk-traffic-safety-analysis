@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         description="Traffic Scene Risk-Scoring Experiment Runner",
     )
     p.add_argument(
-        "--provider", default="gemini", choices=["gemini", "openai"],
+        "--provider", default="gemini", choices=["gemini", "openai", "ollama"],
         help="VLM provider to use (default: gemini).",
     )
     p.add_argument(

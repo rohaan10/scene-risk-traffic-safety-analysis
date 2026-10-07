@@ -4,9 +4,10 @@ VLM Client – Multi-Provider Wrapper
 Stateless client that sends an image (+ optional YOLO text) to a
 Vision-Language Model and parses the structured two-line response.
 
-Supported back-ends (selected via ``provider`` argument):
+    Supported back-ends (selected via ``provider`` argument):
   • ``"gemini"``  – Google Gemini API  (``google-genai``)
   • ``"openai"``  – OpenAI GPT-4o / GPT-4 Vision  (``openai``)
+  • ``"ollama"``  – Local Ollama instance (OpenAI-compatible)
 
 The client is deliberately stateless: each call is independent with
 no conversation memory, ensuring fair experimental conditions.
@@ -97,6 +98,7 @@ class VLMClient:
     _DEFAULTS = {
         "gemini": "gemini-3.8-flash",
         "openai": "gpt-4o",
+        "ollama": "gemma4:26b",
     }
 
     def __init__(
@@ -113,6 +115,8 @@ class VLMClient:
             self._init_gemini()
         elif self.provider == "openai":
             self._init_openai()
+        elif self.provider == "ollama":
+            self._init_ollama()
         else:
             raise ValueError(f"Unsupported provider: {self.provider!r}")
 
@@ -137,6 +141,17 @@ class VLMClient:
                 "Set OPENAI_API_KEY env var or pass api_key= to VLMClient."
             )
         self._openai_client = OpenAI(api_key=key)
+
+    def _init_ollama(self) -> None:
+        from openai import OpenAI
+
+        # Ollama is usually hosted at localhost:11434
+        # It doesn't require an API key by default.
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        self._ollama_client = OpenAI(
+            base_url=base_url,
+            api_key="ollama",  # dummy key required by the client
+        )
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -177,6 +192,8 @@ class VLMClient:
             try:
                 if self.provider == "gemini":
                     raw = self._call_gemini(image_path, user_prompt)
+                elif self.provider == "ollama":
+                    raw = self._call_ollama(image_path, user_prompt)
                 else:
                     raw = self._call_openai(image_path, user_prompt)
                 return parse_vlm_response(raw)
@@ -250,3 +267,37 @@ class VLMClient:
             ],
         )
         return response.choices[0].message.content
+
+    # ── Ollama back-end (OpenAI-compatible) ──────────────────────────
+    def _call_ollama(self, image_path: str, user_prompt: str) -> str:
+        data_uri = _image_to_base64(image_path)
+
+        response = self._ollama_client.chat.completions.create(
+            model=self.model,
+            temperature=0.2,
+            max_tokens=512,
+            # Reserve the output budget for the two-line answer.
+            reasoning_effort="minimal",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_uri},
+                        },
+                    ],
+                },
+            ],
+        )
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise ValueError("Ollama response was truncated by the output token limit.")
+        raw = choice.message.content
+        if not raw or not raw.strip():
+            raise ValueError("Ollama returned an empty final answer.")
+        if parse_vlm_response(raw).confidence_score < 0:
+            raise ValueError(f"Ollama response is missing a Confidence score: {raw!r}")
+        return raw

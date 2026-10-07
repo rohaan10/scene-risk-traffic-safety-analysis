@@ -40,7 +40,7 @@ data/
 
 > **Note:** The `data/` folder is gitignored. Each team member must add their own images locally.
 
-### 4. Set up API key (required for VLM scoring, skip if YOLO-only)
+### 4. Set up API key (required for VLM scoring, skip if YOLO-only or using Ollama)
 
 1. Go to [aistudio.google.com](https://aistudio.google.com)
 2. Sign in with your Google account
@@ -53,10 +53,16 @@ Then create a `.env` file in the project root:
 cp .env.example .env
 ```
 
-Open `.env` and paste your key:
+Open `.env` and paste your key (if using Gemini):
 
 ```
 GEMINI_API_KEY=AIzaSy...your-key-here
+```
+
+If using **Ollama**, you don't need an API key. You can optionally set the base URL if it's not the default:
+
+```
+OLLAMA_BASE_URL=http://localhost:11434/v1
 ```
 
 > **Important:** A web subscription (Gemini Advanced, ChatGPT Plus) does **not** provide API access. You need an API key from Google AI Studio (free) or OpenAI Platform (paid).
@@ -122,7 +128,7 @@ python main.py
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--provider` | `gemini` | VLM provider: `gemini` or `openai` |
+| `--provider` | `gemini` | VLM provider: `gemini`, `openai`, or `ollama` |
 | `--model` | auto | Model name override (e.g., `gpt-4o`, `gemini-2.0-flash`) |
 | `--yolo-model` | `yolo26n.pt` | YOLO model weights (auto-downloaded on first run) |
 | `--yolo-conf` | `0.35` | YOLO confidence threshold |
@@ -135,6 +141,9 @@ python main.py
 ```bash
 # Use OpenAI instead of Gemini
 uv run python main.py --provider openai
+
+# Use Ollama with a specific model (e.g. gemma4:26b)
+uv run python main.py --provider ollama --model gemma4:26b
 
 # Lower YOLO confidence to detect more objects
 uv run python main.py --yolo-conf 0.25
