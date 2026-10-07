@@ -277,7 +277,7 @@ class VLMClient:
             temperature=0.2,
             max_tokens=512,
             # Reserve the output budget for the two-line answer.
-            reasoning_effort="minimal",
+            reasoning_effort="none",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
