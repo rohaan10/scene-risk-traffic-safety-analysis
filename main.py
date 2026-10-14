@@ -90,16 +90,18 @@ def main() -> None:
         print(f"Error: Images directory not found: {images_dir}")
         sys.exit(1)
 
-    image_paths = list_images(images_dir)
-    if not image_paths:
+    all_image_paths = list_images(images_dir)
+    if not all_image_paths:
         print(f"No images found in {images_dir}")
         sys.exit(0)
 
+    total_dataset_count = len(all_image_paths)
+    image_paths = all_image_paths
     if args.limit and args.limit > 0:
-        image_paths = image_paths[:args.limit]
-        print(f"Limiting execution to first {len(image_paths)} image(s).\n")
+        image_paths = all_image_paths[:args.limit]
+        print(f"Limiting execution to first {len(image_paths)} of {total_dataset_count} image(s).\n")
 
-    print(f"Found {len(image_paths)} image(s) to process in {images_dir}\n")
+    print(f"Processing {len(image_paths)} image(s) from {images_dir}\n")
 
     # ── Load ground truth (if available) ─────────────────────────────
     gt_map: dict[str, float] = {}
@@ -141,19 +143,22 @@ def main() -> None:
         # 2. VLM scoring
         resp_a: VLMResponse | None = None
         resp_b: VLMResponse | None = None
-        score_a, meaning_a, raw_a = -1, "", ""
-        score_b, meaning_b, raw_b = -1, "", ""
+        score_a, meaning_a, raw_a = None, "", ""
+        score_b, meaning_b, raw_b = None, "", ""
+        duration_a, duration_b = 0.0, 0.0
 
         if vlm is not None:
             # Condition A: image-only
             print("  VLM Condition A (image-only) …")
             try:
+                t0_a = time.perf_counter()
                 resp_a = vlm.score_image(img_path, yolo_summary=None)
+                duration_a = round(time.perf_counter() - t0_a, 2)
                 score_a = resp_a.confidence_score
                 meaning_a = resp_a.meaning
                 raw_a = resp_a.raw_text
                 disp_a = f"{score_a}/100" if score_a is not None else "NaN"
-                print(f"    → Attention Score: {disp_a} [{resp_a.advisory_state}]")
+                print(f"    → Attention Score: {disp_a} [{resp_a.advisory_state}] ({duration_a}s)")
                 for f in FACTORS:
                     sub = resp_a.factors.get(f, {})
                     if sub:
@@ -164,18 +169,23 @@ def main() -> None:
             # Condition B: image + YOLO
             print("  VLM Condition B (image + YOLO) …")
             try:
+                t0_b = time.perf_counter()
                 resp_b = vlm.score_image(img_path, yolo_summary=yolo_summary)
+                duration_b = round(time.perf_counter() - t0_b, 2)
                 score_b = resp_b.confidence_score
                 meaning_b = resp_b.meaning
                 raw_b = resp_b.raw_text
                 disp_b = f"{score_b}/100" if score_b is not None else "NaN"
-                print(f"    → Attention Score: {disp_b} [{resp_b.advisory_state}]")
+                print(f"    → Attention Score: {disp_b} [{resp_b.advisory_state}] ({duration_b}s)")
                 for f in FACTORS:
                     sub = resp_b.factors.get(f, {})
                     if sub:
                         print(f"      • {f:22s}: {sub.get('score', 0):2d}/10 | {sub.get('reason', '')}")
             except Exception as e:
                 print(f"    ✗ Condition B failed: {e}")
+
+            img_duration = round(duration_a + duration_b, 2)
+            print(f"  ⏱ Total image inference time: {img_duration}s")
 
         # 3. Collect record with sub-scores and advisory states
         gt_score = gt_map.get(image_id, None)
@@ -186,11 +196,14 @@ def main() -> None:
             "condition_a_score": score_a,
             "condition_a_meaning": meaning_a,
             "condition_a_state": resp_a.advisory_state if resp_a else "Unknown",
+            "condition_a_time_sec": duration_a,
             "condition_a_raw": raw_a,
             "condition_b_score": score_b,
             "condition_b_meaning": meaning_b,
             "condition_b_state": resp_b.advisory_state if resp_b else "Unknown",
+            "condition_b_time_sec": duration_b,
             "condition_b_raw": raw_b,
+            "total_time_sec": round(duration_a + duration_b, 2),
             "ground_truth_score": gt_score,
         }
 
@@ -213,6 +226,31 @@ def main() -> None:
     print(f"Results saved to: {RESULTS_CSV}")
     print(f"Annotated images saved to: {ANNOTATED_DIR}")
     print(f"{'═' * 60}")
+
+    # ── Performance summary ──────────────────────────────────────────
+    if vlm is not None and records:
+        times_a = [r["condition_a_time_sec"] for r in records if r.get("condition_a_time_sec", 0) > 0]
+        times_b = [r["condition_b_time_sec"] for r in records if r.get("condition_b_time_sec", 0) > 0]
+        if times_a and times_b:
+            if len(times_a) > 1:
+                # Discard 1st image cold-start (model load into VRAM) to report steady-state average
+                warmup_time = round(times_a[0] + times_b[0], 2)
+                bench_a = times_a[1:]
+                bench_b = times_b[1:]
+                warmup_msg = f" (excludes 1st image cold-start: {warmup_time}s)"
+            else:
+                bench_a = times_a
+                bench_b = times_b
+                warmup_msg = ""
+
+            avg_a = sum(bench_a) / len(bench_a)
+            avg_b = sum(bench_b) / len(bench_b)
+            avg_total = avg_a + avg_b
+            est_total_min = (avg_total * total_dataset_count) / 60
+            print(f"\n⏱ Performance Benchmark ({args.model}):")
+            print(f"  • Steady Condition A avg: {avg_a:.2f}s | Condition B avg: {avg_b:.2f}s{warmup_msg}")
+            print(f"  • Steady average per image (both conditions): {avg_total:.2f}s")
+            print(f"  • Estimated runtime for full dataset ({total_dataset_count} images): {est_total_min:.1f} minutes")
 
     # ── Evaluation (if ground truth available) ───────────────────────
     if not gt_map or args.skip_vlm:

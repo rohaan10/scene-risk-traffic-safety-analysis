@@ -37,7 +37,7 @@ FACTORS = [
     "vulnerable_road_users",
     "conflict_proximity",
     "road_complexity",
-    "visibility",
+    "impaired_visibility",
 ]
 
 WEIGHTS = {
@@ -45,33 +45,50 @@ WEIGHTS = {
     "vulnerable_road_users": 0.25,
     "conflict_proximity": 0.30,
     "road_complexity": 0.15,
-    "visibility": 0.10,
+    "impaired_visibility": 0.10,
 }
+
+# Dynamic hazard factors eligible to trigger the emergency peak attention term
+# (impaired_visibility affects the baseline weighted mean, but does not single-handedly trigger an emergency takeover)
+PEAK_FACTORS = [
+    "traffic_density",
+    "vulnerable_road_users",
+    "conflict_proximity",
+    "road_complexity",
+]
 
 
 def factor_schema() -> dict:
     """JSON schema for factor-based situational complexity evaluation."""
+    schema_props = {}
+    for f in FACTORS:
+        if f == "impaired_visibility":
+            desc = "At most 1 concise sentence explaining visibility impairment (0 = clear daylight, 10 = severely impaired by fog/night/glare)."
+            score_desc = "Score from 0 (crystal clear daylight) to 10 (severely impaired / zero visibility)."
+        else:
+            desc = f"At most 1 concise sentence explaining {f}."
+            score_desc = f"Score for {f} from 0 (none/clear) to 10 (critical/severe)."
+
+        schema_props[f] = {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": desc,
+                },
+                "score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10,
+                    "description": score_desc,
+                },
+            },
+            "required": ["reason", "score"],
+        }
+
     return {
         "type": "object",
-        "properties": {
-            f: {
-                "type": "object",
-                "properties": {
-                    "reason": {
-                        "type": "string",
-                        "description": f"At most 1 concise sentence explaining {f}.",
-                    },
-                    "score": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": 10,
-                        "description": f"Score for {f} from 0 to 10.",
-                    },
-                },
-                "required": ["reason", "score"],
-            }
-            for f in FACTORS
-        },
+        "properties": schema_props,
         "required": FACTORS,
     }
 
@@ -92,18 +109,23 @@ def _normalize_factor_score(raw_value: Any) -> int:
 def aggregate_factor_scores(factors_data: dict[str, dict[str, Any]]) -> int:
     """
     Aggregate 5 factor scores (0-10) into a continuous 0-100 attention score
-    using a max-aware blend of weighted mean (60%) and peak single factor (40%).
+    using a max-aware blend of weighted mean (60%) and peak dynamic obstacle factor (40%).
     """
     scores = {}
     for f in FACTORS:
         sub = factors_data.get(f, {})
+        # Support fallback alias "visibility" if emitted by model
+        if not sub and f == "impaired_visibility" and "visibility" in factors_data:
+            sub = factors_data["visibility"]
+
         if isinstance(sub, dict):
             scores[f] = _normalize_factor_score(sub.get("score", 0))
         else:
             scores[f] = _normalize_factor_score(sub)
 
     wmean = sum(WEIGHTS[f] * scores[f] for f in FACTORS)  # 0-10
-    peak = max(scores.values()) if scores else 0           # 0-10
+    peak_candidates = [scores[f] for f in PEAK_FACTORS if f in scores]
+    peak = max(peak_candidates) if peak_candidates else 0  # 0-10
     final_score = round(10 * (0.6 * wmean + 0.4 * peak))   # 0-100
     return max(0, min(final_score, 100))
 
@@ -202,6 +224,9 @@ def parse_vlm_response(raw: str) -> VLMResponse:
         data = json.loads(json_text)
         if isinstance(data, dict):
             # A. Factor-based JSON
+            if "impaired_visibility" not in data and "visibility" in data:
+                data["impaired_visibility"] = data["visibility"]
+
             factor_keys_present = [f for f in FACTORS if f in data]
             if factor_keys_present:
                 factors_dict: dict[str, dict[str, Any]] = {}
@@ -287,8 +312,9 @@ def parse_vlm_response(raw: str) -> VLMResponse:
     # ── 2. Regex Factor Parsing (robust against truncated JSON) ───────
     factors_extracted: dict[str, dict[str, Any]] = {}
     for f in FACTORS:
+        name_pat = rf'(?:{f}|visibility)' if f == "impaired_visibility" else f
         pattern = re.compile(
-            rf'["\']?{f}["\']?\s*:\s*\{{?(?:[^{{}}]*?["\']?reason["\']?\s*:\s*["\']([^"\'\n]+)["\']?[,\s]*?)?["\']?score["\']?\s*:\s*(\d{{1,2}})',
+            rf'["\']?{name_pat}["\']?\s*:\s*\{{?(?:[^{{}}]*?["\']?reason["\']?\s*:\s*["\']([^"\'\n]+)["\']?[,\s]*?)?["\']?score["\']?\s*:\s*(\d{{1,2}})',
             re.IGNORECASE,
         )
         m = pattern.search(clean)

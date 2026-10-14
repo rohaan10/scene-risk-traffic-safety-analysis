@@ -24,14 +24,15 @@ FACTORS_RUBRIC: str = (
     "  2. vulnerable_road_users: Pedestrians, cyclists, or animals near the roadway.\n"
     "  3. conflict_proximity: Any road user or obstacle close to or crossing the ego vehicle path.\n"
     "  4. road_complexity: Intersections, roundabouts, lane merges, tracks, construction.\n"
-    "  5. visibility: Lighting conditions, weather, sun glare, or sight-line occlusions.\n\n"
+    "  5. impaired_visibility: Visibility impairment or sight hazards (0 = crystal clear, 10 = severely impaired by fog/night/glare).\n\n"
+    "Note: Higher scores always indicate higher risk or attention required (0 = safe/clear, 10 = critical hazard).\n\n"
     "Scoring rubric (0 to 10):\n"
-    "  • 0–1: Absent or irrelevant (clear/empty)\n"
+    "  • 0–1: Absent, clear, or irrelevant (e.g. empty street, crystal clear daylight)\n"
     "  • 2–3: Minor, far away, routine monitoring\n"
     "  • 4–6: Noticeable, active vigilance needed\n"
-    "  • 7–8: Close or active, likely to matter\n"
+    "  • 7–8: Close, active, or significant hazard\n"
     "  • 9–10: Immediate conflict or critical hazard\n\n"
-    "Use the full range; a typical quiet street should score mostly 0–3.\n"
+    "Use the full range; a typical quiet street in good weather should score mostly 0–2.\n"
     "For EACH factor, give exactly one short sentence explaining your reason BEFORE its score.\n\n"
     "Respond strictly as JSON in this exact structure:\n"
     "{\n"
@@ -39,7 +40,7 @@ FACTORS_RUBRIC: str = (
     '  "vulnerable_road_users": {"reason": "<1 short sentence>", "score": <0-10>},\n'
     '  "conflict_proximity": {"reason": "<1 short sentence>", "score": <0-10>},\n'
     '  "road_complexity": {"reason": "<1 short sentence>", "score": <0-10>},\n'
-    '  "visibility": {"reason": "<1 short sentence>", "score": <0-10>}\n'
+    '  "impaired_visibility": {"reason": "<1 short sentence>", "score": <0-10>}\n'
     "}"
 )
 
