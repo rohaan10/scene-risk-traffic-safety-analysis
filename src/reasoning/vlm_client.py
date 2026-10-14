@@ -5,6 +5,7 @@ Stateless client that sends an image (+ optional YOLO text) to a
 Vision-Language Model and parses the structured two-line response.
 
 Supported back-ends (selected via ``provider`` argument):
+  • ``"ollama"``  – Local Ollama server (no API key required)
   • ``"gemini"``  – Google Gemini API  (``google-genai``)
   • ``"openai"``  – OpenAI GPT-4o / GPT-4 Vision  (``openai``)
 
@@ -15,6 +16,7 @@ no conversation memory, ensuring fair experimental conditions.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import time
@@ -40,22 +42,81 @@ class VLMResponse:
 
 # ── Response parser ──────────────────────────────────────────────────────
 
-_CONFIDENCE_RE = re.compile(r"[Cc]onfidence\s*:\s*(\d{1,3})")
-_MEANING_RE = re.compile(r"[Mm]eaning\s*:\s*(.+)", re.DOTALL)
+# Regex patterns – used as fallback when JSON parsing fails.
+# These intentionally match both plain and markdown-bold formatted output
+# (e.g. "**Confidence:** 45" or "Confidence: 0.83").
+_CONFIDENCE_RE = re.compile(
+    r"\*{0,2}[Cc]onfidence\*{0,2}\s*:\s*\*{0,2}\s*(\d{1,3}(?:\.\d+)?)"
+)
+_MEANING_RE = re.compile(
+    r"\*{0,2}[Mm]eaning\*{0,2}\s*:\s*\*{0,2}\s*(.+)", re.DOTALL
+)
+
+
+def _normalize_score(raw_value: str | float | int) -> int:
+    """
+    Convert a raw score value to an integer in [0, 100].
+
+    Handles:
+      - Integers already in 0–100 range  (e.g. 45)
+      - Floats in 0.0–1.0 range          (e.g. 0.83 → 83)
+      - Float strings                     (e.g. "0.65" → 65)
+    """
+    try:
+        val = float(raw_value)
+    except (ValueError, TypeError):
+        return -1
+
+    # If the value is in 0–1 range (exclusive of 1), treat as a fraction
+    if 0.0 <= val <= 1.0 and val != 0.0:
+        val = val * 100
+
+    score = int(round(val))
+    return max(0, min(score, 100))
 
 
 def parse_vlm_response(raw: str) -> VLMResponse:
     """
-    Extract ``confidence_score`` and ``meaning`` from the VLM's
-    two-line output.  Falls back gracefully on malformed replies.
+    Extract ``confidence_score`` and ``meaning`` from the VLM's output.
+
+    Parsing strategy (in order of priority):
+      1. JSON  – if the response is a valid JSON object.
+      2. Regex – last match of ``Confidence:`` / ``Meaning:`` patterns
+         (last match avoids capturing echoed YOLO confidence decimals).
+      3. Fallback – score = -1, meaning = raw text.
     """
-    score_match = _CONFIDENCE_RE.search(raw)
-    meaning_match = _MEANING_RE.search(raw)
+    clean = raw.strip()
 
-    score = int(score_match.group(1)) if score_match else -1
-    score = max(0, min(score, 100)) if score >= 0 else -1
+    # ── 1. Try JSON parsing (strip markdown code fences if present) ───
+    json_text = clean
+    if json_text.startswith("```"):
+        json_text = re.sub(
+            r"^```(?:json)?\s*\n?(.*?)\n?\s*```$", r"\1",
+            json_text, flags=re.DOTALL,
+        ).strip()
 
-    meaning = meaning_match.group(1).strip() if meaning_match else raw.strip()
+    try:
+        data = json.loads(json_text)
+        score_val = data.get("Confidence", data.get("confidence", -1))
+        meaning = data.get("Meaning", data.get("meaning", ""))
+        score = _normalize_score(score_val)
+        return VLMResponse(
+            confidence_score=score,
+            meaning=str(meaning).strip(),
+            raw_text=raw,
+        )
+    except (json.JSONDecodeError, AttributeError):
+        pass  # fall through to regex
+
+    # ── 2. Regex parsing (take LAST match to skip YOLO echoes) ────────
+    conf_matches = _CONFIDENCE_RE.findall(clean)
+    meaning_match = _MEANING_RE.search(clean)
+
+    # Use LAST confidence match — the model's answer typically comes
+    # after any echoed YOLO detection confidence values.
+    score = _normalize_score(conf_matches[-1]) if conf_matches else -1
+
+    meaning = meaning_match.group(1).strip() if meaning_match else clean
 
     return VLMResponse(
         confidence_score=score,
@@ -64,11 +125,17 @@ def parse_vlm_response(raw: str) -> VLMResponse:
     )
 
 
-# ── Helper: encode image to base64 data-URI ─────────────────────────────
+# ── Helper: encode image to base64 ──────────────────────────────────────
 
-def _image_to_base64(image_path: str) -> str:
+def _image_to_base64_raw(image_path: str) -> str:
+    """Return raw base64 string (no data-URI prefix)."""
     with open(image_path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("utf-8")
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def _image_to_data_uri(image_path: str) -> str:
+    """Return full data-URI (for OpenAI)."""
+    encoded = _image_to_base64_raw(image_path)
     ext = Path(image_path).suffix.lower().lstrip(".")
     mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(ext, "image/jpeg")
     return f"data:{mime};base64,{encoded}"
@@ -85,31 +152,38 @@ class VLMClient:
     Parameters
     ----------
     provider : str
-        ``"gemini"`` or ``"openai"``.
+        ``"ollama"``, ``"gemini"``, or ``"openai"``.
     model : str | None
-        Model identifier (e.g. ``"gemini-3.8-flash"`` or ``"gpt-4o"``).
-        Defaults are chosen per provider if omitted.
+        Model identifier.  Defaults are chosen per provider if omitted:
+        ``"moondream"`` for Ollama, ``"gemini-3.8-flash"`` for Gemini,
+        ``"gpt-4o"`` for OpenAI.
     api_key : str | None
-        Explicit API key.  Falls back to the ``GEMINI_API_KEY`` or
-        ``OPENAI_API_KEY`` environment variable.
+        Explicit API key (not required for Ollama).
+    ollama_host : str | None
+        Ollama server URL.  Defaults to ``http://localhost:11434``.
     """
 
     _DEFAULTS = {
+        "ollama": "qwen2-vl:7b",
         "gemini": "gemini-3.8-flash",
         "openai": "gpt-4o",
     }
 
     def __init__(
         self,
-        provider: str = "gemini",
+        provider: str = "ollama",
         model: Optional[str] = None,
         api_key: Optional[str] = None,
+        ollama_host: Optional[str] = None,
     ) -> None:
         self.provider = provider.lower()
-        self.model = model or self._DEFAULTS.get(self.provider, "gemini-3.8-flash")
+        self.model = model or self._DEFAULTS.get(self.provider, "moondream")
         self.api_key = api_key
+        self.ollama_host = ollama_host
 
-        if self.provider == "gemini":
+        if self.provider == "ollama":
+            self._init_ollama()
+        elif self.provider == "gemini":
             self._init_gemini()
         elif self.provider == "openai":
             self._init_openai()
@@ -117,6 +191,21 @@ class VLMClient:
             raise ValueError(f"Unsupported provider: {self.provider!r}")
 
     # ── Provider initialisers ────────────────────────────────────────
+
+    def _init_ollama(self) -> None:
+        import ollama
+
+        host = self.ollama_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        self._ollama_client = ollama.Client(host=host)
+        # Verify connectivity
+        try:
+            self._ollama_client.list()
+        except Exception as e:
+            raise ConnectionError(
+                f"Cannot connect to Ollama at {host}. "
+                f"Make sure Ollama is running ('ollama serve') and the model "
+                f"is pulled ('ollama pull {self.model}'). Error: {e}"
+            )
 
     def _init_gemini(self) -> None:
         from google import genai
@@ -175,7 +264,9 @@ class VLMClient:
         last_error: Exception | None = None
         for attempt in range(1 + max_retries):
             try:
-                if self.provider == "gemini":
+                if self.provider == "ollama":
+                    raw = self._call_ollama(image_path, user_prompt)
+                elif self.provider == "gemini":
                     raw = self._call_gemini(image_path, user_prompt)
                 else:
                     raw = self._call_openai(image_path, user_prompt)
@@ -195,6 +286,34 @@ class VLMClient:
                 last_error = e
 
         raise last_error  # unreachable, but keeps type-checkers happy
+
+    # ── Ollama back-end ──────────────────────────────────────────────
+
+    def _call_ollama(self, image_path: str, user_prompt: str) -> str:
+        """
+        Call a local Ollama vision model.  Stateless: each call creates
+        a fresh conversation with no history.
+        """
+        # Combine system prompt and user prompt into the message
+        # (some smaller models don't fully respect system roles,
+        #  so we prepend it to the user message for robustness)
+        full_prompt = f"{SYSTEM_PROMPT}\n\n---\n\n{user_prompt}"
+
+        response = self._ollama_client.chat(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": full_prompt,
+                    "images": [image_path],
+                },
+            ],
+            options={
+                "temperature": 0.2,
+                "num_predict": 256,
+            },
+        )
+        return response.message.content
 
     # ── Gemini back-end ──────────────────────────────────────────────
 
@@ -229,7 +348,7 @@ class VLMClient:
     # ── OpenAI back-end ──────────────────────────────────────────────
 
     def _call_openai(self, image_path: str, user_prompt: str) -> str:
-        data_uri = _image_to_base64(image_path)
+        data_uri = _image_to_data_uri(image_path)
 
         response = self._openai_client.chat.completions.create(
             model=self.model,

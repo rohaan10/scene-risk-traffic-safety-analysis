@@ -47,12 +47,12 @@ def parse_args() -> argparse.Namespace:
         description="Traffic Scene Risk-Scoring Experiment Runner",
     )
     p.add_argument(
-        "--provider", default="gemini", choices=["gemini", "openai"],
-        help="VLM provider to use (default: gemini).",
+        "--provider", default="ollama", choices=["ollama", "gemini", "openai"],
+        help="VLM provider to use (default: ollama).",
     )
     p.add_argument(
         "--model", default=None,
-        help="VLM model name override (e.g. 'gpt-4o', 'gemini-3.8-flash').",
+        help="VLM model name override (e.g. 'moondream', 'gemini-3.8-flash', 'gpt-4o').",
     )
     p.add_argument(
         "--yolo-model", default="yolo26n.pt",
@@ -131,8 +131,8 @@ def main() -> None:
         yolo.save_annotated_image(img_path, perception, ann_path)
 
         # 2. VLM scoring
-        score_a, meaning_a = -1, ""
-        score_b, meaning_b = -1, ""
+        score_a, meaning_a, raw_a = -1, "", ""
+        score_b, meaning_b, raw_b = -1, "", ""
 
         if vlm is not None:
             # Condition A: image-only
@@ -141,6 +141,7 @@ def main() -> None:
                 resp_a: VLMResponse = vlm.score_image(img_path, yolo_summary=None)
                 score_a = resp_a.confidence_score
                 meaning_a = resp_a.meaning
+                raw_a = resp_a.raw_text
                 print(f"    → Score: {score_a}  |  {meaning_a[:80]}")
             except Exception as e:
                 print(f"    ✗ Condition A failed: {e}")
@@ -151,6 +152,7 @@ def main() -> None:
                 resp_b: VLMResponse = vlm.score_image(img_path, yolo_summary=yolo_summary)
                 score_b = resp_b.confidence_score
                 meaning_b = resp_b.meaning
+                raw_b = resp_b.raw_text
                 print(f"    → Score: {score_b}  |  {meaning_b[:80]}")
             except Exception as e:
                 print(f"    ✗ Condition B failed: {e}")
@@ -163,8 +165,10 @@ def main() -> None:
             "yolo_summary": yolo_summary,
             "condition_a_score": score_a,
             "condition_a_meaning": meaning_a,
+            "condition_a_raw": raw_a,
             "condition_b_score": score_b,
             "condition_b_meaning": meaning_b,
+            "condition_b_raw": raw_b,
             "ground_truth_score": gt_score,
         })
 

@@ -2,7 +2,7 @@
 Prompt Templates – Condition A & Condition B
 ─────────────────────────────────────────────
 Stateless (memory-free) system and user prompts for the comparative
-VLM risk-scoring experiment.
+VLM driver-attention evaluation experiment.
 
 Both conditions instruct the VLM to output exactly two lines:
     Confidence: <0–100>
@@ -15,22 +15,22 @@ from __future__ import annotations
 
 SYSTEM_PROMPT: str = (
     "You are an expert traffic safety analyst working for an autonomous "
-    "vehicle research programme.  You evaluate single traffic scene images "
-    "and produce a numerical risk/danger score between 0 (completely safe, "
-    "empty road) and 100 (extreme imminent danger, collision unavoidable).\n\n"
+    "vehicle research programme. You evaluate single traffic scene images "
+    "and assess how much driver attention/vigilance is required, producing "
+    "a numerical score between 0 (very little attention needed, calm/clear road) "
+    "and 100 (full, immediate driver attention required, critical situation).\n\n"
     "Guidelines:\n"
-    "  • Assess overall scene risk from the perspective of an automated "
-    "vehicle driver (ego vehicle).\n"
-    "  • Consider pedestrian proximity, vehicle density, speed cues, road "
-    "geometry, weather/visibility, and any unusual or hazardous behaviour.\n"
-    "  • Be concise.  Do NOT produce any additional text beyond the two "
+    "  • Assess the required level of driver attention from the perspective "
+    "of an automated vehicle driver or human supervisor (ego vehicle).\n"
+    "  • Consider factors such as pedestrian proximity, vulnerable road users, "
+    "vehicle density, unexpected obstacles, road geometry, speed cues, "
+    "visibility, and any potential hazards requiring active monitoring or intervention.\n"
+    "  • Be concise. Do NOT produce any additional text beyond the two "
     "required output lines.\n\n"
     "Your output MUST follow this exact format (no extra lines):\n"
     "Confidence: <integer 0-100>\n"
-    "Meaning: <one-sentence explanation of the primary hazard or reason "
-    "for the score>"
+    "Meaning: <one-sentence explanation of why this level of driver attention is required>"
 )
-
 
 # ── Condition A — Image-Only ─────────────────────────────────────────────
 
@@ -43,13 +43,13 @@ def build_condition_a_prompt() -> str:
     """
     return (
         "Analyze this traffic scene image from the perspective of an "
-        "automated vehicle driver.  Rate the overall danger/risk score "
-        "on a scale from 0 (no danger) to 100 (extreme danger).  Reply "
-        "with exactly two lines:\n"
+        "automated vehicle driver or supervisor. Rate how much attention "
+        "the driver needs in this scene on a scale from 0 (very little attention "
+        "required) to 100 (full, immediate attention required). Reply with "
+        "exactly two lines:\n"
         "Confidence: <score>\n"
         "Meaning: <brief explanation>"
     )
-
 
 # ── Condition B — Image + YOLO Spatial Metadata ─────────────────────────
 
@@ -65,12 +65,13 @@ def build_condition_b_prompt(yolo_summary: str) -> str:
     """
     return (
         "Analyze this traffic scene image from the perspective of an "
-        "automated vehicle driver.\n\n"
+        "automated vehicle driver or supervisor.\n\n"
         "Here is explicit object detection data extracted from the scene:\n"
         f"{yolo_summary}\n\n"
-        "Combined with the image, rate the overall danger/risk score on a "
-        "scale from 0 (no danger) to 100 (extreme danger).  Reply with "
-        "exactly two lines:\n"
+        "Combined with the image, rate how much attention the driver needs "
+        "in this scene on a scale from 0 (very little attention required) "
+        "to 100 (full, immediate attention required). Reply with exactly "
+        "two lines:\n"
         "Confidence: <score>\n"
         "Meaning: <brief explanation>"
     )
