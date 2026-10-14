@@ -106,10 +106,34 @@ def main() -> None:
     # ── Load ground truth (if available) ─────────────────────────────
     gt_map: dict[str, float] = {}
     if GROUND_TRUTH_PATH.is_file():
-        gt_df = pd.read_csv(GROUND_TRUTH_PATH)
-        if {"image_id", "human_score"}.issubset(gt_df.columns):
-            gt_map = dict(zip(gt_df["image_id"].astype(str), gt_df["human_score"]))
-            print(f"Loaded {len(gt_map)} ground-truth entries.\n")
+        try:
+            gt_df = pd.read_csv(GROUND_TRUTH_PATH)
+            if "image_id" in gt_df.columns:
+                # Option 1: 5 factor sub-scores – auto-calculate exact aggregate human score in Python
+                if set(FACTORS).issubset(gt_df.columns) and any(gt_df[f].notna().any() for f in FACTORS):
+                    from src.reasoning.vlm_client import aggregate_factor_scores
+                    for _, row in gt_df.iterrows():
+                        f_data = {}
+                        for f in FACTORS:
+                            val = row.get(f)
+                            if pd.notna(val):
+                                try:
+                                    f_data[f] = {"score": float(val)}
+                                except ValueError:
+                                    pass
+                        if len(f_data) == len(FACTORS):
+                            gt_map[str(row["image_id"])] = aggregate_factor_scores(f_data)
+
+                # Option 2: Direct numeric human_score column (if factors were not provided)
+                if not gt_map and "human_score" in gt_df.columns:
+                    numeric_hs = pd.to_numeric(gt_df["human_score"], errors="coerce")
+                    valid_mask = numeric_hs.notna()
+                    if valid_mask.any():
+                        gt_map = dict(zip(gt_df.loc[valid_mask, "image_id"].astype(str), numeric_hs[valid_mask]))
+
+                print(f"Loaded {len(gt_map)} ground-truth entries from {GROUND_TRUTH_PATH.name}.\n")
+        except Exception as e:
+            print(f"⚠️ Could not load ground truth from {GROUND_TRUTH_PATH}: {e}\n")
 
     # ── Initialise components ────────────────────────────────────────
     print("Initialising YOLO perception extractor …")
