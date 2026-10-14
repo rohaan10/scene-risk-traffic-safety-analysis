@@ -14,22 +14,33 @@ from __future__ import annotations
 # ── Shared system prompt (identical for both conditions) ─────────────────
 
 SYSTEM_PROMPT: str = (
-    "You are an expert traffic safety analyst working for an autonomous "
-    "vehicle research programme. You evaluate single traffic scene images "
-    "and assess how much driver attention/vigilance is required, producing "
-    "a numerical score between 0 (very little attention needed, calm/clear road) "
-    "and 100 (full, immediate driver attention required, critical situation).\n\n"
-    "Guidelines:\n"
-    "  • Assess the required level of driver attention from the perspective "
-    "of an automated vehicle driver or human supervisor (ego vehicle).\n"
-    "  • Consider factors such as pedestrian proximity, vulnerable road users, "
-    "vehicle density, unexpected obstacles, road geometry, speed cues, "
-    "visibility, and any potential hazards requiring active monitoring or intervention.\n"
-    "  • Be concise. Do NOT produce any additional text beyond the two "
-    "required output lines.\n\n"
-    "Your output MUST follow this exact format (no extra lines):\n"
-    "Confidence: <integer 0-100>\n"
-    "Meaning: <one-sentence explanation of why this level of driver attention is required>"
+    "You are an expert traffic safety analyst evaluating situational complexity and "
+    "driver attention requirements for an autonomous vehicle supervisor."
+)
+
+FACTORS_RUBRIC: str = (
+    "Assess situational complexity by evaluating these 5 core factors from 0 to 10:\n"
+    "  1. traffic_density: Density, proximity, and behavior of surrounding vehicles.\n"
+    "  2. vulnerable_road_users: Pedestrians, cyclists, or animals near the roadway.\n"
+    "  3. conflict_proximity: Any road user or obstacle close to or crossing the ego vehicle path.\n"
+    "  4. road_complexity: Intersections, roundabouts, lane merges, tracks, construction.\n"
+    "  5. visibility: Lighting conditions, weather, sun glare, or sight-line occlusions.\n\n"
+    "Scoring rubric (0 to 10):\n"
+    "  • 0–1: Absent or irrelevant (clear/empty)\n"
+    "  • 2–3: Minor, far away, routine monitoring\n"
+    "  • 4–6: Noticeable, active vigilance needed\n"
+    "  • 7–8: Close or active, likely to matter\n"
+    "  • 9–10: Immediate conflict or critical hazard\n\n"
+    "Use the full range; a typical quiet street should score mostly 0–3.\n"
+    "For EACH factor, give exactly one short sentence explaining your reason BEFORE its score.\n\n"
+    "Respond strictly as JSON in this exact structure:\n"
+    "{\n"
+    '  "traffic_density": {"reason": "<1 short sentence>", "score": <0-10>},\n'
+    '  "vulnerable_road_users": {"reason": "<1 short sentence>", "score": <0-10>},\n'
+    '  "conflict_proximity": {"reason": "<1 short sentence>", "score": <0-10>},\n'
+    '  "road_complexity": {"reason": "<1 short sentence>", "score": <0-10>},\n'
+    '  "visibility": {"reason": "<1 short sentence>", "score": <0-10>}\n'
+    "}"
 )
 
 # ── Condition A — Image-Only ─────────────────────────────────────────────
@@ -37,18 +48,11 @@ SYSTEM_PROMPT: str = (
 def build_condition_a_prompt() -> str:
     """
     Return the user-turn prompt for **Condition A** (image-only).
-
-    The image itself is attached separately as a multimodal input;
-    this function provides only the textual instruction.
     """
     return (
-        "Analyze this traffic scene image from the perspective of an "
-        "automated vehicle driver or supervisor. Rate how much attention "
-        "the driver needs in this scene on a scale from 0 (very little attention "
-        "required) to 100 (full, immediate attention required). Reply with "
-        "exactly two lines:\n"
-        "Confidence: <score>\n"
-        "Meaning: <brief explanation>"
+        "Analyze this traffic scene image from the perspective of an automated "
+        "vehicle supervisor.\n\n"
+        f"{FACTORS_RUBRIC}"
     )
 
 # ── Condition B — Image + YOLO Spatial Metadata ─────────────────────────
@@ -56,22 +60,12 @@ def build_condition_a_prompt() -> str:
 def build_condition_b_prompt(yolo_summary: str) -> str:
     """
     Return the user-turn prompt for **Condition B** (image + YOLO metadata).
-
-    Parameters
-    ----------
-    yolo_summary : str
-        The spatial-context text produced by
-        ``PerceptionResult.to_text_summary()``.
     """
     return (
-        "Analyze this traffic scene image from the perspective of an "
-        "automated vehicle driver or supervisor.\n\n"
+        "Analyze this traffic scene image from the perspective of an automated "
+        "vehicle supervisor.\n\n"
         "Here is explicit object detection data extracted from the scene:\n"
         f"{yolo_summary}\n\n"
-        "Combined with the image, rate how much attention the driver needs "
-        "in this scene on a scale from 0 (very little attention required) "
-        "to 100 (full, immediate attention required). Reply with exactly "
-        "two lines:\n"
-        "Confidence: <score>\n"
-        "Meaning: <brief explanation>"
+        "Combined with the visual image, evaluate the scene:\n\n"
+        f"{FACTORS_RUBRIC}"
     )

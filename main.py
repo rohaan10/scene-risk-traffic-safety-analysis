@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 # ── Project imports ──────────────────────────────────────────────────────
 from src.perception.yolo_extractor import YOLOPerceptionExtractor
-from src.reasoning.vlm_client import VLMClient, VLMResponse
+from src.reasoning.vlm_client import VLMClient, VLMResponse, FACTORS
 from src.evaluation.metrics import (
     compute_correlation,
     compute_classification_metrics,
@@ -74,6 +74,10 @@ def parse_args() -> argparse.Namespace:
         "--skip-vlm", action="store_true",
         help="Run YOLO only (skip VLM calls). Useful for testing perception.",
     )
+    p.add_argument(
+        "--limit", type=int, default=None,
+        help="Limit processing to first N images (useful for quick smoke tests).",
+    )
     return p.parse_args()
 
 
@@ -91,7 +95,11 @@ def main() -> None:
         print(f"No images found in {images_dir}")
         sys.exit(0)
 
-    print(f"Found {len(image_paths)} image(s) in {images_dir}\n")
+    if args.limit and args.limit > 0:
+        image_paths = image_paths[:args.limit]
+        print(f"Limiting execution to first {len(image_paths)} image(s).\n")
+
+    print(f"Found {len(image_paths)} image(s) to process in {images_dir}\n")
 
     # ── Load ground truth (if available) ─────────────────────────────
     gt_map: dict[str, float] = {}
@@ -131,6 +139,8 @@ def main() -> None:
         yolo.save_annotated_image(img_path, perception, ann_path)
 
         # 2. VLM scoring
+        resp_a: VLMResponse | None = None
+        resp_b: VLMResponse | None = None
         score_a, meaning_a, raw_a = -1, "", ""
         score_b, meaning_b, raw_b = -1, "", ""
 
@@ -138,39 +148,63 @@ def main() -> None:
             # Condition A: image-only
             print("  VLM Condition A (image-only) …")
             try:
-                resp_a: VLMResponse = vlm.score_image(img_path, yolo_summary=None)
+                resp_a = vlm.score_image(img_path, yolo_summary=None)
                 score_a = resp_a.confidence_score
                 meaning_a = resp_a.meaning
                 raw_a = resp_a.raw_text
-                print(f"    → Score: {score_a}  |  {meaning_a[:80]}")
+                disp_a = f"{score_a}/100" if score_a is not None else "NaN"
+                print(f"    → Attention Score: {disp_a} [{resp_a.advisory_state}]")
+                for f in FACTORS:
+                    sub = resp_a.factors.get(f, {})
+                    if sub:
+                        print(f"      • {f:22s}: {sub.get('score', 0):2d}/10 | {sub.get('reason', '')}")
             except Exception as e:
                 print(f"    ✗ Condition A failed: {e}")
 
             # Condition B: image + YOLO
             print("  VLM Condition B (image + YOLO) …")
             try:
-                resp_b: VLMResponse = vlm.score_image(img_path, yolo_summary=yolo_summary)
+                resp_b = vlm.score_image(img_path, yolo_summary=yolo_summary)
                 score_b = resp_b.confidence_score
                 meaning_b = resp_b.meaning
                 raw_b = resp_b.raw_text
-                print(f"    → Score: {score_b}  |  {meaning_b[:80]}")
+                disp_b = f"{score_b}/100" if score_b is not None else "NaN"
+                print(f"    → Attention Score: {disp_b} [{resp_b.advisory_state}]")
+                for f in FACTORS:
+                    sub = resp_b.factors.get(f, {})
+                    if sub:
+                        print(f"      • {f:22s}: {sub.get('score', 0):2d}/10 | {sub.get('reason', '')}")
             except Exception as e:
                 print(f"    ✗ Condition B failed: {e}")
 
-        # 3. Collect record
+        # 3. Collect record with sub-scores and advisory states
         gt_score = gt_map.get(image_id, None)
-        records.append({
+        record = {
             "image_id": image_id,
             "yolo_detections": len(perception.detections),
             "yolo_summary": yolo_summary,
             "condition_a_score": score_a,
             "condition_a_meaning": meaning_a,
+            "condition_a_state": resp_a.advisory_state if resp_a else "Unknown",
             "condition_a_raw": raw_a,
             "condition_b_score": score_b,
             "condition_b_meaning": meaning_b,
+            "condition_b_state": resp_b.advisory_state if resp_b else "Unknown",
             "condition_b_raw": raw_b,
             "ground_truth_score": gt_score,
-        })
+        }
+
+        # Save individual factor sub-scores and reasons as separate columns
+        for f in FACTORS:
+            f_a = resp_a.factors.get(f, {}) if resp_a else {}
+            record[f"cond_a_{f}_score"] = f_a.get("score", None)
+            record[f"cond_a_{f}_reason"] = f_a.get("reason", "")
+
+            f_b = resp_b.factors.get(f, {}) if resp_b else {}
+            record[f"cond_b_{f}_score"] = f_b.get("score", None)
+            record[f"cond_b_{f}_reason"] = f_b.get("reason", "")
+
+        records.append(record)
 
     # ── Save results CSV ─────────────────────────────────────────────
     results_df = pd.DataFrame(records)
@@ -186,7 +220,9 @@ def main() -> None:
         return
 
     # Filter to rows with valid scores and ground truth
-    eval_df = results_df.dropna(subset=["ground_truth_score"])
+    eval_df = results_df.dropna(
+        subset=["ground_truth_score", "condition_a_score", "condition_b_score"]
+    )
     eval_df = eval_df[
         (eval_df["condition_a_score"] >= 0) & (eval_df["condition_b_score"] >= 0)
     ]

@@ -20,9 +20,9 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from src.reasoning.prompts import (
     SYSTEM_PROMPT,
@@ -30,98 +30,315 @@ from src.reasoning.prompts import (
     build_condition_b_prompt,
 )
 
+# ── 5-Factor Complexity Architecture ─────────────────────────────────────
+
+FACTORS = [
+    "traffic_density",
+    "vulnerable_road_users",
+    "conflict_proximity",
+    "road_complexity",
+    "visibility",
+]
+
+WEIGHTS = {
+    "traffic_density": 0.20,
+    "vulnerable_road_users": 0.25,
+    "conflict_proximity": 0.30,
+    "road_complexity": 0.15,
+    "visibility": 0.10,
+}
+
+
+def factor_schema() -> dict:
+    """JSON schema for factor-based situational complexity evaluation."""
+    return {
+        "type": "object",
+        "properties": {
+            f: {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": f"At most 1 concise sentence explaining {f}.",
+                    },
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10,
+                        "description": f"Score for {f} from 0 to 10.",
+                    },
+                },
+                "required": ["reason", "score"],
+            }
+            for f in FACTORS
+        },
+        "required": FACTORS,
+    }
+
+
+def _normalize_factor_score(raw_value: Any) -> int:
+    """Normalize a factor score to an integer in [0, 10]."""
+    try:
+        val = float(raw_value)
+    except (ValueError, TypeError):
+        return 0
+    # If the model emitted a 0-1 float (e.g. 0.8), scale to 0-10
+    if 0.0 < val < 1.0:
+        val = val * 10
+    score = int(round(val))
+    return max(0, min(score, 10))
+
+
+def aggregate_factor_scores(factors_data: dict[str, dict[str, Any]]) -> int:
+    """
+    Aggregate 5 factor scores (0-10) into a continuous 0-100 attention score
+    using a max-aware blend of weighted mean (60%) and peak single factor (40%).
+    """
+    scores = {}
+    for f in FACTORS:
+        sub = factors_data.get(f, {})
+        if isinstance(sub, dict):
+            scores[f] = _normalize_factor_score(sub.get("score", 0))
+        else:
+            scores[f] = _normalize_factor_score(sub)
+
+    wmean = sum(WEIGHTS[f] * scores[f] for f in FACTORS)  # 0-10
+    peak = max(scores.values()) if scores else 0           # 0-10
+    final_score = round(10 * (0.6 * wmean + 0.4 * peak))   # 0-100
+    return max(0, min(final_score, 100))
+
+
+def determine_advisory_state(score: Optional[int | float]) -> str:
+    """
+    Map continuous 0-100 attention score to driver advisory state:
+      - Incomplete (None, NaN, or <0)
+      - Relax (<25)
+      - Stay Alert (25-64)
+      - Take Control (>=65)
+    """
+    if score is None or (isinstance(score, float) and (score < 0 or score != score)):
+        return "Incomplete"
+    if score < 0:
+        return "Incomplete"
+    elif score < 25:
+        return "Relax"
+    elif score < 65:
+        return "Stay Alert"
+    else:
+        return "Take Control"
+
 
 @dataclass
 class VLMResponse:
     """Parsed output from the VLM."""
 
-    confidence_score: int        # 0–100 risk score
-    meaning: str                 # qualitative explanation
-    raw_text: str                # full model reply (for debugging)
+    confidence_score: Optional[int]                 # 0–100 aggregated driver attention / risk score (None if Incomplete)
+    meaning: str                                    # qualitative explanation / synthesized reasoning
+    raw_text: str                                   # full model reply (for debugging)
+    factors: dict[str, dict[str, Any]] = field(     # sub-scores & reasons per factor
+        default_factory=dict
+    )
+    advisory_state: str = "Stay Alert"             # Relax, Stay Alert, Take Control, Incomplete
+
+    @property
+    def attention_score(self) -> Optional[int]:
+        """Alias for confidence_score representing driver attention required."""
+        return self.confidence_score
 
 
 # ── Response parser ──────────────────────────────────────────────────────
 
-# Regex patterns – used as fallback when JSON parsing fails.
-# These intentionally match both plain and markdown-bold formatted output
-# (e.g. "**Confidence:** 45" or "Confidence: 0.83").
-_CONFIDENCE_RE = re.compile(
-    r"\*{0,2}[Cc]onfidence\*{0,2}\s*:\s*\*{0,2}\s*(\d{1,3}(?:\.\d+)?)"
+_SCORE_RE = re.compile(
+    r"\*{0,2}(?:[Aa]ttention(?:\s*[Ss]core)?|[Ss]core|[Rr]isk\s*[Ss]core|[Cc]onfidence)\*{0,2}\s*:\s*\*{0,2}\s*(\d{1,3}(?:\.\d+)?)"
 )
+_CONFIDENCE_RE = _SCORE_RE
+
 _MEANING_RE = re.compile(
-    r"\*{0,2}[Mm]eaning\*{0,2}\s*:\s*\*{0,2}\s*(.+)", re.DOTALL
+    r"\*{0,2}(?:[Mm]eaning|[Rr]eason|[Ee]xplanation)\*{0,2}\s*:\s*\*{0,2}\s*(.*?)(?=\n*\*{0,2}(?:[Aa]ttention(?:\s*[Ss]core)?|[Ss]core|[Rr]isk\s*[Ss]core|[Cc]onfidence)\*{0,2}\s*:|$)",
+    re.DOTALL | re.IGNORECASE,
 )
 
 
-def _normalize_score(raw_value: str | float | int) -> int:
-    """
-    Convert a raw score value to an integer in [0, 100].
-
-    Handles:
-      - Integers already in 0–100 range  (e.g. 45)
-      - Floats in 0.0–1.0 range          (e.g. 0.83 → 83)
-      - Float strings                     (e.g. "0.65" → 65)
-    """
+def _normalize_score(raw_value: str | float | int) -> Optional[int]:
+    """Convert a flat raw score value to an integer in [0, 100], or None if invalid."""
     try:
         val = float(raw_value)
     except (ValueError, TypeError):
-        return -1
+        return None
 
-    # If the value is in 0–1 range (exclusive of 1), treat as a fraction
-    if 0.0 <= val <= 1.0 and val != 0.0:
+    if isinstance(raw_value, float) or (isinstance(raw_value, str) and "." in raw_value):
+        if 0.0 <= val <= 1.0:
+            val = val * 100
+    elif 0.0 < val < 1.0:
         val = val * 100
 
     score = int(round(val))
-    return max(0, min(score, 100))
+    if score < 0 or score > 100:
+        return None
+    return score
 
 
 def parse_vlm_response(raw: str) -> VLMResponse:
     """
-    Extract ``confidence_score`` and ``meaning`` from the VLM's output.
+    Extract factor sub-scores, aggregated score, and meaning from VLM output.
 
-    Parsing strategy (in order of priority):
-      1. JSON  – if the response is a valid JSON object.
-      2. Regex – last match of ``Confidence:`` / ``Meaning:`` patterns
-         (last match avoids capturing echoed YOLO confidence decimals).
-      3. Fallback – score = -1, meaning = raw text.
+    Parsing strategy:
+      1. JSON Factor Parsing  – extracts 5 factors {"reason": ..., "score": ...}
+         and calculates max-aware aggregate.
+      2. JSON Flat Parsing    – handles legacy flat responses {"attention": ..., "meaning": ...}.
+      3. Regex Factor Parsing – extracts factors from malformed or truncated text.
+      4. Regex Flat Fallback  – matches single Attention: / Meaning: lines.
     """
     clean = raw.strip()
 
     # ── 1. Try JSON parsing (strip markdown code fences if present) ───
     json_text = clean
-    if json_text.startswith("```"):
-        json_text = re.sub(
-            r"^```(?:json)?\s*\n?(.*?)\n?\s*```$", r"\1",
-            json_text, flags=re.DOTALL,
-        ).strip()
+    if "```" in json_text:
+        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", json_text, re.DOTALL)
+        if match:
+            json_text = match.group(1).strip()
 
     try:
         data = json.loads(json_text)
-        score_val = data.get("Confidence", data.get("confidence", -1))
-        meaning = data.get("Meaning", data.get("meaning", ""))
-        score = _normalize_score(score_val)
-        return VLMResponse(
-            confidence_score=score,
-            meaning=str(meaning).strip(),
-            raw_text=raw,
-        )
+        if isinstance(data, dict):
+            # A. Factor-based JSON
+            factor_keys_present = [f for f in FACTORS if f in data]
+            if factor_keys_present:
+                factors_dict: dict[str, dict[str, Any]] = {}
+                for f in FACTORS:
+                    if f in data:
+                        sub = data[f]
+                        if isinstance(sub, dict):
+                            f_score = _normalize_factor_score(sub.get("score", 0))
+                            f_reason = str(sub.get("reason", "")).strip()
+                        else:
+                            f_score = _normalize_factor_score(sub)
+                            f_reason = str(sub).strip()
+                        factors_dict[f] = {"score": f_score, "reason": f_reason}
+
+                # Only aggregate if all 5 factors are present; flag partial parses
+                if len(factor_keys_present) == len(FACTORS):
+                    agg_score = aggregate_factor_scores(factors_dict)
+                    advisory = determine_advisory_state(agg_score)
+
+                    # Synthesize meaning from active/notable factors
+                    active = [
+                        f"{f.replace('_', ' ').capitalize()} ({factors_dict[f]['score']}/10): {factors_dict[f]['reason']}"
+                        for f in FACTORS
+                        if factors_dict[f]["score"] >= 2 and factors_dict[f]["reason"]
+                    ]
+                    if not active:
+                        active = [
+                            f"{f.replace('_', ' ').capitalize()}: {factors_dict[f]['reason']}"
+                            for f in FACTORS
+                            if factors_dict[f]["reason"]
+                        ]
+                    meaning_text = "; ".join(active) if active else "Routine road conditions, no immediate hazards."
+
+                    return VLMResponse(
+                        confidence_score=agg_score,
+                        meaning=meaning_text,
+                        raw_text=raw,
+                        factors=factors_dict,
+                        advisory_state=advisory,
+                    )
+                else:
+                    print(
+                        f"    ⚠️ Incomplete factor parse ({len(factor_keys_present)}/{len(FACTORS)} factors recovered). "
+                        f"Flagging as Incomplete (NaN)."
+                    )
+                    return VLMResponse(
+                        confidence_score=None,
+                        meaning=f"Incomplete factor parse ({len(factor_keys_present)}/{len(FACTORS)} factors recovered).",
+                        raw_text=raw,
+                        factors=factors_dict,
+                        advisory_state="Incomplete",
+                    )
+
+            # B. Legacy Flat JSON
+            score_val = -1
+            for k in (
+                "attention_score", "Attention_Score", "attention", "Attention",
+                "Confidence", "confidence", "Score", "score", "Risk_Score", "risk_score",
+            ):
+                if k in data:
+                    score_val = data[k]
+                    break
+
+            meaning = ""
+            for k in (
+                "meaning", "Meaning", "reason", "Reason", "explanation", "Explanation",
+            ):
+                if k in data:
+                    meaning = data[k]
+                    break
+
+            score = _normalize_score(score_val)
+            return VLMResponse(
+                confidence_score=score,
+                meaning=str(meaning).strip(),
+                raw_text=raw,
+                factors={},
+                advisory_state=determine_advisory_state(score),
+            )
     except (json.JSONDecodeError, AttributeError):
         pass  # fall through to regex
 
-    # ── 2. Regex parsing (take LAST match to skip YOLO echoes) ────────
-    conf_matches = _CONFIDENCE_RE.findall(clean)
+    # ── 2. Regex Factor Parsing (robust against truncated JSON) ───────
+    factors_extracted: dict[str, dict[str, Any]] = {}
+    for f in FACTORS:
+        pattern = re.compile(
+            rf'["\']?{f}["\']?\s*:\s*\{{?(?:[^{{}}]*?["\']?reason["\']?\s*:\s*["\']([^"\'\n]+)["\']?[,\s]*?)?["\']?score["\']?\s*:\s*(\d{{1,2}})',
+            re.IGNORECASE,
+        )
+        m = pattern.search(clean)
+        if m:
+            r_str = (m.group(1) or "").strip()
+            s_val = int(m.group(2))
+            factors_extracted[f] = {"score": min(s_val, 10), "reason": r_str}
+
+    if len(factors_extracted) == len(FACTORS):
+        agg_score = aggregate_factor_scores(factors_extracted)
+        advisory = determine_advisory_state(agg_score)
+        active = [
+            f"{f.replace('_', ' ').capitalize()}: {factors_extracted[f]['reason']}"
+            for f in FACTORS
+            if factors_extracted[f]["reason"]
+        ]
+        meaning_text = "; ".join(active) if active else "Scene evaluated via sub-scores."
+        return VLMResponse(
+            confidence_score=agg_score,
+            meaning=meaning_text,
+            raw_text=raw,
+            factors=factors_extracted,
+            advisory_state=advisory,
+        )
+    elif len(factors_extracted) >= 1:
+        print(
+            f"    ⚠️ Truncated VLM response: regex recovered only {len(factors_extracted)}/{len(FACTORS)} factors. "
+            f"Flagging as Incomplete (NaN)."
+        )
+        return VLMResponse(
+            confidence_score=None,
+            meaning=f"Truncated response: {len(factors_extracted)}/{len(FACTORS)} factors recovered.",
+            raw_text=raw,
+            factors=factors_extracted,
+            advisory_state="Incomplete",
+        )
+
+    # ── 3. Regex Flat Parsing (legacy format) ─────────────────────────
+    score_matches = _SCORE_RE.findall(clean)
     meaning_match = _MEANING_RE.search(clean)
 
-    # Use LAST confidence match — the model's answer typically comes
-    # after any echoed YOLO detection confidence values.
-    score = _normalize_score(conf_matches[-1]) if conf_matches else -1
-
-    meaning = meaning_match.group(1).strip() if meaning_match else clean
+    score = _normalize_score(score_matches[-1]) if score_matches else None
+    meaning = meaning_match.group(1).strip() if (meaning_match and meaning_match.group(1).strip()) else clean
 
     return VLMResponse(
         confidence_score=score,
         meaning=meaning,
         raw_text=raw,
+        factors={},
+        advisory_state=determine_advisory_state(score),
     )
 
 
@@ -164,7 +381,7 @@ class VLMClient:
     """
 
     _DEFAULTS = {
-        "ollama": "qwen2-vl:7b",
+        "ollama": "gemma3:12b",
         "gemini": "gemini-3.8-flash",
         "openai": "gpt-4o",
     }
@@ -177,7 +394,7 @@ class VLMClient:
         ollama_host: Optional[str] = None,
     ) -> None:
         self.provider = provider.lower()
-        self.model = model or self._DEFAULTS.get(self.provider, "moondream")
+        self.model = model or self._DEFAULTS.get(self.provider, "gemma3:12b")
         self.api_key = api_key
         self.ollama_host = ollama_host
 
@@ -294,26 +511,47 @@ class VLMClient:
         Call a local Ollama vision model.  Stateless: each call creates
         a fresh conversation with no history.
         """
-        # Combine system prompt and user prompt into the message
-        # (some smaller models don't fully respect system roles,
-        #  so we prepend it to the user message for robustness)
         full_prompt = f"{SYSTEM_PROMPT}\n\n---\n\n{user_prompt}"
 
-        response = self._ollama_client.chat(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": full_prompt,
-                    "images": [image_path],
+        # JSON schema for 5-factor situational complexity evaluation
+        response_schema = factor_schema()
+
+        # Attempt structured schema constraint; fall back gracefully if unsupported
+        try:
+            response = self._ollama_client.chat(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": full_prompt,
+                        "images": [image_path],
+                    },
+                ],
+                format=response_schema,
+                options={
+                    "temperature": 0.2,
+                    "num_predict": 500,
                 },
-            ],
-            options={
-                "temperature": 0.2,
-                "num_predict": 256,
-            },
-        )
-        return response.message.content
+                keep_alive="10m",
+            )
+            return response.message.content
+        except Exception:
+            response = self._ollama_client.chat(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": full_prompt,
+                        "images": [image_path],
+                    },
+                ],
+                options={
+                    "temperature": 0.2,
+                    "num_predict": 500,
+                },
+                keep_alive="10m",
+            )
+            return response.message.content
 
     # ── Gemini back-end ──────────────────────────────────────────────
 
@@ -340,7 +578,7 @@ class VLMClient:
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0.2,
-                max_output_tokens=256,
+                max_output_tokens=500,
             ),
         )
         return response.text
@@ -353,7 +591,7 @@ class VLMClient:
         response = self._openai_client.chat.completions.create(
             model=self.model,
             temperature=0.2,
-            max_tokens=256,
+            max_tokens=500,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
