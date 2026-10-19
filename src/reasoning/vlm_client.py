@@ -126,7 +126,8 @@ def aggregate_factor_scores(factors_data: dict[str, dict[str, Any]]) -> int:
     wmean = sum(WEIGHTS[f] * scores[f] for f in FACTORS)  # 0-10
     peak_candidates = [scores[f] for f in PEAK_FACTORS if f in scores]
     peak = max(peak_candidates) if peak_candidates else 0  # 0-10
-    final_score = round(10 * (0.6 * wmean + 0.4 * peak))   # 0-100
+    blend = 0.2 * wmean + 0.8 * peak if peak >= 7 else 0.6 * wmean + 0.4 * peak
+    final_score = round(10 * blend)
     return max(0, min(final_score, 100))
 
 
