@@ -71,11 +71,31 @@ def correlation_line(ax, x, y) -> None:
     ax.legend(fontsize=9)
 
 
+def load_gut_scores(gt_arg: str | None) -> pd.DataFrame | None:
+    """Load the instinctive (gut) 0-100 score per image from ground_truth.csv."""
+    candidates = [Path(gt_arg)] if gt_arg else [
+        ROOT / "ground_truth.csv", ROOT / "output" / "ground_truth.csv",
+        ROOT / "data" / "ground_truth.csv",
+    ]
+    for path in candidates:
+        if path.is_file():
+            gt = pd.read_csv(path)
+            if "image_id" in gt.columns and "driver_state_gut" in gt.columns:
+                return gt[["image_id", "driver_state_gut"]]
+            print(f"  ⚠ {path} lacks image_id/driver_state_gut columns — skipping gut analysis")
+            return None
+    print("  ⚠ ground_truth.csv not found — skipping gut-score analysis (use --ground-truth)")
+    return None
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Analyse experiment results")
     p.add_argument("--results",   default=str(RESULTS), help="Path to experiment_results.csv")
     p.add_argument("--threshold", type=int, default=70, help="Risk score binarisation threshold")
+    p.add_argument("--ground-truth", default=None,
+                   help="Path to ground_truth.csv (needs image_id + driver_state_gut). "
+                        "Default: searches next to the script and in output/")
     return p.parse_args()
 
 
@@ -239,6 +259,53 @@ def main() -> None:
     fig.savefig(out, dpi=150)
     print(f"  Saved: {out.name}")
     plt.close(fig)
+
+    # ── 7. Instinctive (gut) score vs Cond A / Cond B ────────────────────────
+    gut_df = load_gut_scores(args.ground_truth)
+    if gut_df is not None:
+        m = df.merge(gut_df, on="image_id", how="left")
+        m = m.dropna(subset=["driver_state_gut", "condition_a_score", "condition_b_score"])
+        m = m[(m["condition_a_score"] >= 0) & (m["condition_b_score"] >= 0)]
+        print(f"\n{'═'*60}\n  GUT-INSTINCT SCORE ANALYSIS (n={len(m)})\n{'═'*60}")
+        if len(m) >= 3:
+            gut = m["driver_state_gut"].values.astype(float)
+            panels = [("condition_a_score", "Cond A: Image-only", "#4C9BE8"),
+                      ("condition_b_score", "Cond B: Image + YOLO", "#E8834C")]
+            has_formula = "ground_truth_score" in m.columns and m["ground_truth_score"].notna().sum() >= 3
+            if has_formula:
+                panels.append(("ground_truth_score", "Formula GT (factor-based)", "#5CBF72"))
+            for col, label, _ in panels:
+                sc = m[col].values.astype(float)
+                ok = ~np.isnan(sc)
+                r, p_r = stats.pearsonr(sc[ok], gut[ok])
+                rho, p_rho = stats.spearmanr(sc[ok], gut[ok])
+                mae = np.mean(np.abs(sc[ok] - gut[ok]))
+                bias = np.mean(sc[ok] - gut[ok])
+                print(f"\n  {label} vs gut:")
+                print(f"    Pearson r = {r:+.3f} (p={p_r:.3f})   Spearman ρ = {rho:+.3f} (p={p_rho:.3f})")
+                print(f"    MAE = {mae:.1f}   mean bias (model − gut) = {bias:+.1f}")
+
+            fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 5))
+            for ax, (col, label, color) in zip(np.atleast_1d(axes), panels):
+                x = gut
+                y = m[col].values.astype(float)
+                ax.scatter(x, y, alpha=0.7, s=50, color=color, edgecolors="white", linewidth=0.5)
+                correlation_line(ax, x, y)
+                ax.plot([0, 100], [0, 100], "k--", lw=0.8, alpha=0.4, label="Perfect agreement")
+                ax.set_xlim(0, 100); ax.set_ylim(0, 100)
+                ax.set_xlabel("Gut-instinct score", fontsize=11)
+                ax.set_ylabel("Score", fontsize=11)
+                ax.set_title(label, fontsize=11, fontweight="bold")
+                ax.legend(fontsize=8)
+            fig.suptitle("Scores vs Gut-Instinct Ground Truth", fontsize=13, fontweight="bold")
+            fig.tight_layout()
+            out = FIGURES / "06_scatter_gut_vs_model.png"
+            fig.savefig(out, dpi=150)
+            print(f"\n  Saved: {out.name}")
+            plt.close(fig)
+        else:
+            print(f"  ⚠ Only {len(m)} image(s) matched — need ≥ 3.")
+        print(f"\n{'═'*60}")
 
     print(f"\n  All figures saved to: {FIGURES}\n")
 
