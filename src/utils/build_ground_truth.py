@@ -34,6 +34,7 @@ def generate_ground_truth_table(
     images_dir: Path = RAW_IMAGES_DIR,
     output_path: Path = GROUND_TRUTH_CSV,
     num_members: int = 4,
+    merge: bool = False,
 ) -> None:
     """Scan images and create the team ground-truth CSV divided equally among members."""
     if not images_dir.is_dir():
@@ -71,6 +72,25 @@ def generate_ground_truth_table(
 
     df = pd.DataFrame(records)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if merge and output_path.is_file():
+        existing = pd.read_csv(output_path, dtype=str).fillna("")
+        new_ids = set(df["image_id"]) - set(existing["image_id"])
+        if new_ids:
+            new_rows = df[df["image_id"].isin(new_ids)]
+            merged = pd.concat([existing, new_rows], ignore_index=True)
+            merged.to_csv(output_path, index=False)
+            print(f"\n{'═' * 60}")
+            print(f"✅ Appended {len(new_ids)} new image(s) to: {output_path}")
+            for nid in sorted(new_ids):
+                assigned = df.loc[df["image_id"] == nid, "assigned_to"].values[0]
+                print(f"   + {nid}  →  {assigned}")
+            print(f"   Existing {len(existing)} row(s) preserved unchanged.")
+            print(f"{'═' * 60}\n")
+        else:
+            print("No new images found – ground_truth.csv is already up to date.")
+        return
+
     df.to_csv(output_path, index=False)
 
     print(f"\n{'═' * 60}")
@@ -90,12 +110,17 @@ def main():
     parser.add_argument("--images-dir", type=Path, default=RAW_IMAGES_DIR, help="Path to raw images")
     parser.add_argument("--output", type=Path, default=GROUND_TRUTH_CSV, help="Output CSV destination")
     parser.add_argument("--members", type=int, default=4, help="Number of team members")
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="Append only new images to the existing CSV, preserving all filled-in scores."
+    )
 
     args = parser.parse_args()
     generate_ground_truth_table(
         images_dir=args.images_dir,
         output_path=args.output,
         num_members=args.members,
+        merge=args.merge,
     )
 
 

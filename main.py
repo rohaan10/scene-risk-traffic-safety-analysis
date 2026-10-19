@@ -13,9 +13,11 @@ Batch pipeline that:
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +42,8 @@ GROUND_TRUTH_PATH = DATA_DIR / "ground_truth.csv"
 OUTPUT_DIR = ROOT / "output"
 ANNOTATED_DIR = OUTPUT_DIR / "annotated_images"
 RESULTS_CSV = OUTPUT_DIR / "experiment_results.csv"
+REASONS_CSV = OUTPUT_DIR / "experiment_reasons.csv"
+DEBUG_CSV = OUTPUT_DIR / "experiment_debug.csv"
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,6 +82,16 @@ def parse_args() -> argparse.Namespace:
         "--limit", type=int, default=None,
         help="Limit processing to first N images (useful for quick smoke tests).",
     )
+    p.add_argument(
+        "--gt-url", type=str, default=None,
+        metavar="URL",
+        help=(
+            "Google Sheets share/export URL for the ground-truth spreadsheet. "
+            "Accepts the normal sharing URL (docs.google.com/spreadsheets/d/<ID>/edit…) "
+            "or a direct CSV export URL. When provided, the sheet is downloaded fresh "
+            "each run and the local ground_truth.csv is ignored."
+        ),
+    )
     return p.parse_args()
 
 
@@ -105,35 +119,60 @@ def main() -> None:
 
     # ── Load ground truth (if available) ─────────────────────────────
     gt_map: dict[str, float] = {}
-    if GROUND_TRUTH_PATH.is_file():
+    gt_df: pd.DataFrame | None = None
+
+    if args.gt_url:
+        # Convert a normal Google Sheets share URL to a CSV export URL
+        url = args.gt_url.strip()
+        if "docs.google.com/spreadsheets" in url and "export" not in url:
+            # Extract the spreadsheet ID and rebuild as a CSV export link
+            import re as _re
+            _m = _re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
+            if _m:
+                sheet_id = _m.group(1)
+                url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+        try:
+            print(f"⬇️  Downloading ground truth from Google Sheets …")
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                csv_bytes = resp.read()
+            gt_df = pd.read_csv(io.BytesIO(csv_bytes))
+            print(f"   ✓ Downloaded {len(gt_df)} rows.\n")
+        except Exception as e:
+            print(f"⚠️  Could not download ground truth from URL: {e}\n")
+    elif GROUND_TRUTH_PATH.is_file():
         try:
             gt_df = pd.read_csv(GROUND_TRUTH_PATH)
-            if "image_id" in gt_df.columns:
-                # Option 1: 5 factor sub-scores – auto-calculate exact aggregate human score in Python
-                if set(FACTORS).issubset(gt_df.columns) and any(gt_df[f].notna().any() for f in FACTORS):
-                    from src.reasoning.vlm_client import aggregate_factor_scores
-                    for _, row in gt_df.iterrows():
-                        f_data = {}
-                        for f in FACTORS:
-                            val = row.get(f)
-                            if pd.notna(val):
-                                try:
-                                    f_data[f] = {"score": float(val)}
-                                except ValueError:
-                                    pass
-                        if len(f_data) == len(FACTORS):
-                            gt_map[str(row["image_id"])] = aggregate_factor_scores(f_data)
-
-                # Option 2: Direct numeric human_score column (if factors were not provided)
-                if not gt_map and "human_score" in gt_df.columns:
-                    numeric_hs = pd.to_numeric(gt_df["human_score"], errors="coerce")
-                    valid_mask = numeric_hs.notna()
-                    if valid_mask.any():
-                        gt_map = dict(zip(gt_df.loc[valid_mask, "image_id"].astype(str), numeric_hs[valid_mask]))
-
-                print(f"Loaded {len(gt_map)} ground-truth entries from {GROUND_TRUTH_PATH.name}.\n")
         except Exception as e:
             print(f"⚠️ Could not load ground truth from {GROUND_TRUTH_PATH}: {e}\n")
+
+    if gt_df is not None and "image_id" in gt_df.columns:
+        try:
+            from src.reasoning.vlm_client import aggregate_factor_scores
+            # Option 1: 5 factor sub-scores – aggregate the same way as VLM output
+            if set(FACTORS).issubset(gt_df.columns) and any(gt_df[f].notna().any() for f in FACTORS):
+                for _, row in gt_df.iterrows():
+                    f_data = {}
+                    for f in FACTORS:
+                        val = row.get(f)
+                        if pd.notna(val):
+                            try:
+                                f_data[f] = {"score": float(val)}
+                            except (ValueError, TypeError):
+                                pass
+                    if len(f_data) == len(FACTORS):
+                        gt_map[str(row["image_id"])] = aggregate_factor_scores(f_data)
+
+            # Option 2: Direct human_score column (fallback)
+            if not gt_map and "human_score" in gt_df.columns:
+                numeric_hs = pd.to_numeric(gt_df["human_score"], errors="coerce")
+                valid_mask = numeric_hs.notna()
+                if valid_mask.any():
+                    gt_map = dict(zip(gt_df.loc[valid_mask, "image_id"].astype(str), numeric_hs[valid_mask]))
+
+            source = args.gt_url if args.gt_url else GROUND_TRUTH_PATH.name
+            print(f"Loaded {len(gt_map)} ground-truth entries from {source}.\n")
+        except Exception as e:
+            print(f"⚠️ Could not parse ground truth: {e}\n")
 
     # ── Initialise components ────────────────────────────────────────
     print("Initialising YOLO perception extractor …")
@@ -150,6 +189,8 @@ def main() -> None:
     # ── Process each image ───────────────────────────────────────────
     os.makedirs(ANNOTATED_DIR, exist_ok=True)
     records: list[dict] = []
+    reasons_records: list[dict] = []
+    debug_records: list[dict] = []
 
     for idx, img_path in enumerate(image_paths, start=1):
         image_id = image_id_from_path(img_path)
@@ -211,44 +252,58 @@ def main() -> None:
             img_duration = round(duration_a + duration_b, 2)
             print(f"  ⏱ Total image inference time: {img_duration}s")
 
-        # 3. Collect record with sub-scores and advisory states
+        # 3. Collect records
         gt_score = gt_map.get(image_id, None)
+
+        # ── Main results (15 cols, human-readable) ────────────────────
         record = {
             "image_id": image_id,
             "yolo_detections": len(perception.detections),
-            "yolo_summary": yolo_summary,
             "condition_a_score": score_a,
-            "condition_a_meaning": meaning_a,
             "condition_a_state": resp_a.advisory_state if resp_a else "Unknown",
             "condition_a_time_sec": duration_a,
-            "condition_a_raw": raw_a,
             "condition_b_score": score_b,
-            "condition_b_meaning": meaning_b,
             "condition_b_state": resp_b.advisory_state if resp_b else "Unknown",
             "condition_b_time_sec": duration_b,
-            "condition_b_raw": raw_b,
             "total_time_sec": round(duration_a + duration_b, 2),
             "ground_truth_score": gt_score,
         }
-
-        # Save individual factor sub-scores and reasons as separate columns
         for f in FACTORS:
             f_a = resp_a.factors.get(f, {}) if resp_a else {}
-            record[f"cond_a_{f}_score"] = f_a.get("score", None)
-            record[f"cond_a_{f}_reason"] = f_a.get("reason", "")
-
             f_b = resp_b.factors.get(f, {}) if resp_b else {}
+            record[f"cond_a_{f}_score"] = f_a.get("score", None)
             record[f"cond_b_{f}_score"] = f_b.get("score", None)
-            record[f"cond_b_{f}_reason"] = f_b.get("reason", "")
-
         records.append(record)
 
-    # ── Save results CSV ─────────────────────────────────────────────
+        # ── Reasons (separate CSV) ────────────────────────────────────
+        reason_row: dict = {"image_id": image_id}
+        for f in FACTORS:
+            f_a = resp_a.factors.get(f, {}) if resp_a else {}
+            f_b = resp_b.factors.get(f, {}) if resp_b else {}
+            reason_row[f"cond_a_{f}_reason"] = f_a.get("reason", "")
+            reason_row[f"cond_b_{f}_reason"] = f_b.get("reason", "")
+        reasons_records.append(reason_row)
+
+        # ── Debug (raw LLM output + YOLO summary) ────────────────────
+        debug_records.append({
+            "image_id": image_id,
+            "yolo_summary": yolo_summary,
+            "condition_a_raw": raw_a,
+            "condition_b_raw": raw_b,
+        })
+
+    # ── Save CSVs ────────────────────────────────────────────────────
     results_df = pd.DataFrame(records)
     results_df.to_csv(RESULTS_CSV, index=False)
+
+    pd.DataFrame(reasons_records).to_csv(REASONS_CSV, index=False)
+    pd.DataFrame(debug_records).to_csv(DEBUG_CSV, index=False)
+
     print(f"\n{'═' * 60}")
-    print(f"Results saved to: {RESULTS_CSV}")
-    print(f"Annotated images saved to: {ANNOTATED_DIR}")
+    print(f"Results ({len(results_df.columns)} cols) → {RESULTS_CSV}")
+    print(f"Reasons                       → {REASONS_CSV}")
+    print(f"Debug (raw)                   → {DEBUG_CSV}")
+    print(f"Annotated images              → {ANNOTATED_DIR}")
     print(f"{'═' * 60}")
 
     # ── Performance summary ──────────────────────────────────────────
